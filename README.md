@@ -25,12 +25,5 @@ A console-based, city-wide **Smart Parking Management & Congestion Control Syste
 
 - **Language:** Java 11 or higher (uses `String.repeat` and `java.time` APIs)
 - **Dependencies:** None (100% Standard Library)
-
 ---
 
-## 🚀 Getting Started
-
-### 1. Clone the repository
-```bash
-git clone [https://github.com/](https://github.com/)<YOUR_USERNAME>/smart-parking-management-system.git
-cd smart-parking-management-system
