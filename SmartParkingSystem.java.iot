@@ -1,0 +1,228 @@
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * Smart Parking Management & Congestion Control System.
+ *
+ * <p>Features:
+ * <ul>
+ *   <li>Live zone-by-zone slot availability and up to 48-hour occupancy forecasting</li>
+ *   <li>Conflict-free advance reservations, walk-in entries, check-in/out, and cancellations</li>
+ *   <li>Congestion-aware slot allocation balancing load across gates and zones</li>
+ *   <li>Dynamic surge pricing based on occupancy and rush-hour windows</li>
+ *   <li>City-wide parking lot recommendation and automatic full-lot alternatives</li>
+ *   <li>Grace-period no-show auto-release, overstay reassignment, and early-checkout slot release</li>
+ * </ul>
+ *
+ * <p>Compile &amp; Run:
+ * <pre>
+ *   javac SmartParkingSystem.java
+ *   java SmartParkingSystem
+ * </pre>
+ */
+public class SmartParkingSystem {
+    static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("dd MMM HH:mm");
+    static final Scanner IN = new Scanner(System.in);
+    static final ParkingNetwork NET = new ParkingNetwork();
+    static final Random RND = new Random(42);
+
+    public static void main(String[] args) {
+        seedNetwork();
+        simulateTraffic(0.40);
+        System.out.println("*** SMART PARKING MANAGEMENT SYSTEM ***");
+
+        while (true) {
+            LocalDateTime now = SimClock.now();
+            NET.lots.forEach(l -> l.refresh(now));
+
+            System.out.println("\n-------- MENU  (clock: " + now.format(FMT) + ") --------");
+            System.out.println(" 1. View parking availability (now / forecast)");
+            System.out.println(" 2. City congestion dashboard");
+            System.out.println(" 3. Reserve a slot");
+            System.out.println(" 4. Walk-in entry (park now)");
+            System.out.println(" 5. Check in to a reservation");
+            System.out.println(" 6. Check out & pay");
+            System.out.println(" 7. Cancel a reservation");
+            System.out.println(" 8. My bookings (by plate)");
+            System.out.println(" 9. Find the best lot for me (congestion-aware)");
+            System.out.println("10. Advance simulated clock");
+            System.out.println("11. Simulate random traffic");
+            System.out.println(" 0. Exit");
+
+            int choice = askInt("Choose: ", 0, 11);
+            try {
+                switch (choice) {
+                    case 1:  viewAvailability(); break;
+                    case 2:  NET.printDashboard(SimClock.now()); break;
+                    case 3:  reserveFlow(); break;
+                    case 4:  walkInFlow(); break;
+                    case 5:  checkInFlow(); break;
+                    case 6:  checkOutFlow(); break;
+                    case 7:  cancelFlow(); break;
+                    case 8:  myBookings(); break;
+                    case 9:  recommendFlow(); break;
+                    case 10:
+                        SimClock.advance(askInt("Advance by how many minutes? ", 1, 2880));
+                        System.out.println("Clock is now " + SimClock.now().format(FMT));
+                        break;
+                    case 11:
+                        simulateTraffic(0.25);
+                        System.out.println("Random vehicles arrived.");
+                        break;
+                    case 0:
+                        System.out.println("Goodbye!");
+                        return;
+                }
+            } catch (IllegalStateException | IllegalArgumentException ex) {
+                System.out.println("  [!] " + ex.getMessage());
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ Menu Flows ---
+
+    static void viewAvailability() {
+        ParkingLot lot = pickLot();
+        int ahead = askInt("Show status in how many minutes (0 = now, max 2880)? ", 0, 2880);
+        lot.printAvailability(ahead, SimClock.now());
+    }
+
+    static void reserveFlow() {
+        LocalDateTime now = SimClock.now();
+        String plate = askPlate();
+        VehicleType v = pickVehicle();
+        boolean acc = askYesNo("Need an accessible (disabled) bay? (y/n): ");
+        int inMinutes = askInt("Start in how many minutes from now (0 = now)? ", 0, 2880);
+        int dur = askInt("Duration in minutes (15-1440): ", 15, 1440);
+        LocalDateTime start = now.plusMinutes(inMinutes);
+
+        System.out.println("Choose lot (0 = let the system pick the best one for you)");
+        int idx = pickLotIndex(true);
+        ParkingLot lot;
+        if (idx == 0) {
+            double[] xy = askLocation();
+            List<LotOption> opts = NET.recommend(xy[0], xy[1], v, acc, start, dur, now);
+            if (opts.isEmpty()) {
+                throw new IllegalStateException("No lot in the city has a free slot for that request.");
+            }
+            lot = opts.get(0).lot;
+            System.out.println("-> Best lot: " + lot.name);
+        } else {
+            lot = NET.lots.get(idx - 1);
+        }
+
+        try {
+            Reservation r = lot.reserve(plate, v, acc, start, dur, now);
+            printTicket(r);
+        } catch (IllegalStateException full) {
+            if (!full.getMessage().startsWith("No suitable slot")) throw full;
+            System.out.println("  [!] " + full.getMessage());
+            List<LotOption> alts = NET.recommend(lot.x, lot.y, v, acc, start, dur, now);
+            alts.removeIf(o -> o.lot == lot);
+            if (alts.isEmpty()) {
+                System.out.println("  No alternative lots have space either.");
+                return;
+            }
+            System.out.println("  Alternatives nearby:");
+            printOptions(alts);
+            int pick = askInt("  Book an alternative? (0 = no, or option number): ", 0, alts.size());
+            if (pick > 0) {
+                printTicket(alts.get(pick - 1).lot.reserve(plate, v, acc, start, dur, now));
+            }
+        }
+    }
+
+    static void walkInFlow() {
+        LocalDateTime now = SimClock.now();
+        ParkingLot lot = pickLot();
+        String plate = askPlate();
+        VehicleType v = pickVehicle();
+        boolean acc = askYesNo("Need an accessible (disabled) bay? (y/n): ");
+        int dur = askInt("Expected stay in minutes (15-1440): ", 15, 1440);
+
+        try {
+            Reservation r = lot.walkIn(plate, v, acc, dur, now);
+            System.out.println("\n  ENTRY OK. Ticket " + r.id);
+            System.out.printf("  Go to Zone %s, slot %s (%s). Rate Rs.%.0f/h.%n",
+                    r.slot.zone, r.slot.id, r.slot.type, r.ratePerHour);
+        } catch (IllegalStateException full) {
+            System.out.println("  [!] " + full.getMessage());
+            List<LotOption> alts = NET.recommend(lot.x, lot.y, v, acc, now, dur, now);
+            alts.removeIf(o -> o.lot == lot);
+            if (!alts.isEmpty()) {
+                System.out.println("  Redirecting traffic - nearest lots with space:");
+                printOptions(alts);
+            }
+        }
+    }
+
+    static void checkInFlow() {
+        ParkingLot lot = pickLot();
+        String id = ask("Reservation ID (e.g. R1001): ").toUpperCase();
+        Reservation r = lot.checkIn(id, SimClock.now());
+        System.out.printf("  CHECK-IN OK. Proceed to Zone %s, slot %s.%n", r.slot.zone, r.slot.id);
+    }
+
+    static void checkOutFlow() {
+        ParkingLot lot = pickLot();
+        Reservation r = lot.checkOut(askPlate(), SimClock.now());
+        long mins = Duration.between(r.checkIn, r.checkOut).toMinutes();
+        System.out.println("\n  ---------- RECEIPT ----------");
+        System.out.printf("  %s  %s  slot %s%n  Parked %d min%n", r.id, r.plate, r.slot.id, mins);
+        System.out.printf("  Amount due: Rs.%.2f%n  Slot released - thank you!%n", r.fee);
+    }
+
+    static void cancelFlow() {
+        ParkingLot lot = pickLot();
+        Reservation r = lot.cancel(ask("Reservation ID: ").toUpperCase(), SimClock.now());
+        System.out.printf("  Cancelled %s. Cancellation fee: Rs.%.0f%n", r.id, r.fee);
+    }
+
+    static void myBookings() {
+        String plate = askPlate();
+        boolean any = false;
+        for (ParkingLot l : NET.lots) {
+            for (Reservation r : l.reservations.values()) {
+                if (r.plate.equals(plate)) {
+                    System.out.println("  " + r);
+                    any = true;
+                }
+            }
+        }
+        if (!any) System.out.println("  No bookings found for " + plate);
+    }
+
+    static void recommendFlow() {
+        LocalDateTime now = SimClock.now();
+        VehicleType v = pickVehicle();
+        boolean acc = askYesNo("Need an accessible (disabled) bay? (y/n): ");
+        double[] xy = askLocation();
+        int inMinutes = askInt("Arrive in how many minutes (0 = now)? ", 0, 2880);
+        int dur = askInt("Duration in minutes (15-1440): ", 15, 1440);
+
+        List<LotOption> opts = NET.recommend(xy[0], xy[1], v, acc, now.plusMinutes(inMinutes), dur, now);
+        if (opts.isEmpty()) {
+            throw new IllegalStateException("No lot has a free slot for that request.");
+        }
+        System.out.println("\n  Ranked by distance + congestion + price:");
+        printOptions(opts);
+        int pick = askInt("  Reserve one now? (0 = no, or option number): ", 0, opts.size());
+        if (pick > 0) {
+            printTicket(opts.get(pick - 1).lot.reserve(askPlate(), v, acc, now.plusMinutes(inMinutes), dur, now));
+        }
+    }
+
+    // ---------------------------------------------------------- Display Helpers ---
+
+    static void printTicket(Reservation r) {
+        System.out.println("\n  ========== RESERVATION CONFIRMED ==========");
+        System.out.println("  ID      : " + r.id);
+        System.out.println("  Vehicle : " + r.plate + " (" + r.vehicle.label + ")");
+        System.out.println("  Lot     : " + r.lot.name);
+        System.out.println("  Slot    : " + r.slot.id + " [" + r.slot.type + "], Zone " + r.slot.zone
+                + " (use the Zone " + r.slot.zone + " gate)");
+        System.out.println("  Time    : " + r.start.format(FMT) + " -> " + r.end.format(FMT));
+        System.out.printf("  Rate    : Rs.%.2f/h (+ Rs.%.0f booking fee)%n", r.ratePerHour, ParkingLot.BOOKING_
